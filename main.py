@@ -3,6 +3,8 @@ from openai import OpenAI
 import os
 
 app = Flask(__name__)
+
+# Initialize OpenAI client with API key
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 @app.route('/webhook', methods=['POST'])
@@ -12,9 +14,9 @@ def webhook():
 
     try:
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4o-mini",   # ✅ Updated to GPT-4 Omni Mini
             messages=[
-                {"role": "system", "content": "You are a polite, professional AI assistant. Always respond helpfully and never use foul language."},
+                {"role": "system", "content": "You are a polite, professional AI receptionist. Always be helpful, concise, and never use foul language."},
                 {"role": "user", "content": query_text}
             ],
             max_tokens=200
@@ -26,4 +28,4 @@ def webhook():
     return jsonify({"fulfillmentText": ai_response})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True)
