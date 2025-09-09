@@ -2,6 +2,7 @@ flask
 openai>=1.0.0
 google-cloud-texttospeech
 google-cloud-speech
+google-auth
 gspread
 oauth2client
 gunicorn
