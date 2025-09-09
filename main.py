@@ -248,5 +248,5 @@ def webrtc_offer():
 
 # ----------------------------
 if __name__ == "__main__":
-    # Cloud Run expects the app to listen on PORT env var
-    app.run(host="0.0.0.0", port=PORT)
+    port = int(os.getenv("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
