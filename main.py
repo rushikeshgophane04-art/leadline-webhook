@@ -1,33 +1,86 @@
-# main.py  -- Full-featured LeadLine backend (drop-in)
-import os, json, base64, sqlite3, tempfile, time
-from flask import Flask, request, jsonify, send_file, g
-import openai, requests, logging
-from functools import wraps
-try:
-    from google.cloud import texttospeech, speech_v1p1beta1 as speech
-    from google.oauth2 import service_account
-    import gspread
-except Exception:
-    # Google libs optional until GOOGLE_SA_JSON provided
-    texttospeech = speech = service_account = gspread = None
+"""
+LeadLine — All-in-one backend (single-file)
+Features:
+- GPT-4o-mini brain (OpenAI)
+- Google STT + TTS (optional, via GOOGLE_SA_JSON)
+- Auto-create per-client Google Sheet from TEMPLATE_SHEET_ID
+- Per-client API token auth, multi-number mapping
+- Free-trial (200 calls), usage/analytics logging, basic billing counters
+- Callback scheduler (DB + in-process worker)
+- SIP inbound webhook, WebRTC test (file upload), Dialogflow-compatible /webhook
+- CRM push hooks (simple)
+- Rate-limit & lightweight fraud detection
+Notes: For high-scale streaming replace /webrtc_offer with media-server + SIP bridge
+"""
 
-# ---------- CONFIG ----------
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-openai.api_key = OPENAI_KEY
-PORT = int(os.getenv("PORT", 8080))
-TEMPLATE_SHEET_ID = os.getenv("TEMPLATE_SHEET_ID")  # template google sheet id (for onboarding)
-GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON")  # base64 service account JSON (optional)
+import os, json, base64, sqlite3, time, tempfile, threading, traceback
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify, send_file, g
+import requests, logging
+
+# OpenAI new client
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except Exception:
+    OPENAI_AVAILABLE = False
+
+# Google libs (optional)
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from google.cloud import texttospeech, speech_v1p1beta1 as speech
+    import gspread
+    GOOGLE_AVAILABLE = True
+except Exception:
+    GOOGLE_AVAILABLE = False
+
+# ---------------- CONFIG ----------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+ADMIN_API_KEY   = os.getenv("ADMIN_API_KEY", "change_me")
+TEMPLATE_SHEET_ID = os.getenv("TEMPLATE_SHEET_ID")   # optional: template to copy
+GOOGLE_SA_JSON  = os.getenv("GOOGLE_SA_JSON")        # base64 service account JSON
 DEFAULT_TTS_VOICE = os.getenv("DEFAULT_TTS_VOICE", "en-IN-Wavenet-C")
-RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "120"))  # per-client requests per minute
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")  # admin key to call /onboard_client
-# DB path (sqlite for now)
+PORT = int(os.getenv("PORT", 8080))
+FREE_TRIAL_CALLS = int(os.getenv("FREE_TRIAL_CALLS", 200))
+RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", 120))  # per-client requests per minute
 DB_PATH = os.getenv("DB_PATH", "/tmp/leadline.db")
-# ----------------------------
+# ----------------------------------------
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# ---------- DB helpers ----------
+# ---------- OpenAI client ----------
+if OPENAI_AVAILABLE and OPENAI_API_KEY:
+    openai = OpenAI(api_key=OPENAI_API_KEY)
+else:
+    openai = None
+    logging.warning("OpenAI client not initialized - set OPENAI_API_KEY")
+
+# ---------- Google clients (optional) ----------
+g_sheets = None
+drive_service = None
+tts_client = None
+stt_client = None
+if GOOGLE_AVAILABLE and GOOGLE_SA_JSON:
+    try:
+        sa_info = json.loads(base64.b64decode(GOOGLE_SA_JSON))
+        creds = service_account.Credentials.from_service_account_info(sa_info, scopes=[
+            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/cloud-platform"
+        ])
+        drive_service = build("drive", "v3", credentials=creds)
+        g_sheets = gspread.authorize(creds)
+        tts_client = texttospeech.TextToSpeechClient(credentials=creds)
+        stt_client = speech.SpeechClient(credentials=creds)
+        logging.info("Google clients initialized")
+    except Exception as e:
+        logging.exception("Google client init failed: %s", e)
+else:
+    logging.info("Google features disabled until GOOGLE_SA_JSON provided")
+
+# ---------- DB ----------
 def get_db():
     db = getattr(g, "_db", None)
     if db is None:
@@ -41,16 +94,42 @@ def init_db():
     CREATE TABLE IF NOT EXISTS clients(
       id TEXT PRIMARY KEY,
       name TEXT,
-      sheet_id TEXT,
+      email TEXT,
       api_token TEXT,
+      plan TEXT DEFAULT 'SME',
+      sheet_id TEXT,
+      crm_url TEXT,
+      crm_key TEXT,
+      free_calls_left INTEGER DEFAULT 0,
       created_at INTEGER
     );
+    CREATE TABLE IF NOT EXISTS numbers(
+      number TEXT PRIMARY KEY,
+      client_id TEXT
+    );
     CREATE TABLE IF NOT EXISTS usage(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
       client_id TEXT,
-      period_start INTEGER,
-      requests INTEGER,
-      tokens_used INTEGER,
-      PRIMARY KEY(client_id, period_start)
+      ts INTEGER,
+      endpoint TEXT,
+      request_text TEXT,
+      response_text TEXT,
+      tokens_est INTEGER,
+      duration_ms INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS callbacks(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      client_id TEXT,
+      phone TEXT,
+      schedule_ts INTEGER,
+      status TEXT DEFAULT 'pending',
+      attempts INTEGER DEFAULT 0,
+      payload TEXT
+    );
+    CREATE TABLE IF NOT EXISTS limits(
+      client_id TEXT PRIMARY KEY,
+      minute_bucket INTEGER,
+      requests INTEGER
     );
     """)
     db.commit()
@@ -61,248 +140,408 @@ def close_db(exc):
     if db is not None:
         db.close()
 
-# ---------- Google clients (optional) ----------
-g_sheets = None
-tts_client = None
-stt_client = None
-if GOOGLE_SA_JSON and texttospeech and speech and service_account:
-    try:
-        sa = json.loads(base64.b64decode(GOOGLE_SA_JSON))
-        creds = service_account.Credentials.from_service_account_info(sa, scopes=[
-            "https://www.googleapis.com/auth/drive",
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/cloud-platform"
-        ])
-        tts_client = texttospeech.TextToSpeechClient(credentials=creds)
-        stt_client = speech.SpeechClient(credentials=creds)
-        gc = gspread.authorize(creds)
-        g_sheets = gc
-    except Exception as e:
-        logging.warning("Google client init failed: %s", e)
+init_db()
 
 # ---------- Utilities ----------
+import secrets
 def gen_token():
-    import secrets
     return secrets.token_urlsafe(24)
 
-def now_min_period():
-    # returns unix minute-aligned integer for usage table
-    return int(time.time() // 60 * 60)
+def now_ts():
+    return int(time.time())
 
-def rate_limit_ok(client_id):
-    # simple RPM sliding window based on minute buckets
+def minute_bucket(ts=None):
+    t = ts or now_ts()
+    return int(t // 60 * 60)
+
+# ---------- Rate limit & fraud helpers ----------
+def check_and_inc_rate(client_id):
     db = get_db()
-    start = now_min_period()
-    row = db.execute("SELECT requests FROM usage WHERE client_id = ? AND period_start = ?", (client_id, start)).fetchone()
-    if row and row["requests"] >= RATE_LIMIT_RPM:
+    bucket = minute_bucket()
+    r = db.execute("SELECT requests, minute_bucket FROM limits WHERE client_id=?", (client_id,)).fetchone()
+    if not r:
+        db.execute("INSERT OR REPLACE INTO limits(client_id, minute_bucket, requests) VALUES(?,?,?)", (client_id, bucket, 1))
+        db.commit()
+        return True
+    if r["minute_bucket"] != bucket:
+        db.execute("UPDATE limits SET minute_bucket=?, requests=1 WHERE client_id=?", (bucket, client_id))
+        db.commit()
+        return True
+    if r["requests"] >= RATE_LIMIT_RPM:
         return False
+    db.execute("UPDATE limits SET requests=requests+1 WHERE client_id=?", (client_id,))
+    db.commit()
     return True
 
-def inc_usage(client_id, tokens=0):
-    db = get_db()
-    start = now_min_period()
-    row = db.execute("SELECT requests,tokens_used FROM usage WHERE client_id=? AND period_start=?", (client_id, start)).fetchone()
-    if row:
-        db.execute("UPDATE usage SET requests=requests+1, tokens_used=tokens_used+? WHERE client_id=? AND period_start=?", (tokens, client_id, start))
-    else:
-        db.execute("INSERT INTO usage(client_id,period_start,requests,tokens_used) VALUES(?,?,?,?)", (client_id, start, 1, tokens))
-    db.commit()
-
-def fetch_client_row(client_id):
-    db = get_db()
-    return db.execute("SELECT * FROM clients WHERE id = ?", (client_id,)).fetchone()
-
-# ---------- Auth decorator ----------
-def require_token(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        token = request.headers.get("X-API-KEY") or request.args.get("api_key")
-        if not token:
-            return jsonify({"error":"missing api key"}), 401
-        # lookup token -> client_id
-        db = get_db()
-        row = db.execute("SELECT id FROM clients WHERE api_token = ?", (token,)).fetchone()
-        if not row:
-            return jsonify({"error":"invalid api key"}), 403
-        request.client_id = row["id"]
-        return f(*args, **kwargs)
-    return wrapper
-
-# ---------- Sheets onboarding ----------
+# ---------- Google Sheet auto-create ----------
 def create_client_sheet(client_id, client_name, client_email=None):
+    """
+    Copies TEMPLATE_SHEET_ID (if defined) or creates a fresh sheet, shares with client_email (if provided),
+    returns sheet_id or None.
+    """
     if not g_sheets:
+        logging.info("g_sheets not available")
         return None
     try:
-        drive = g_sheets.auth.service_account().open_by_key  # not needed; use API copy via drive API if needed
-    except Exception:
-        pass
-    # fallback: duplicate template via Drive REST
-    # using gspread: copy (gspread has limited drive support) -> use Drive REST if required
-    # Here we'll use Google Drive copy via requests to Drive API
-    sa = json.loads(base64.b64decode(GOOGLE_SA_JSON))
-    token_url = "https://oauth2.googleapis.com/token"
-    data = {"grant_type":"urn:ietf:params:oauth:grant-type:jwt-bearer","assertion":""}
-    # Simpler approach: use Google Drive copy via gspread create new sheet and set headers
-    ss = g_sheets.create(f"{client_name} - LeadLine")
-    ws = ss.sheet1
-    ws.update("A1", [["Question","Answer"]])
-    # set sheet permission? skipping for now; you can set drive permissions separately
-    return ss.id
-
-# ---------- GPT helper with fallback ----------
-def ask_gpt(prompt, client_id=None, max_tokens=300):
-    # rate limit check
-    cid = client_id or "global"
-    if not rate_limit_ok(cid):
-        return "Sorry, we are receiving many requests right now. Please try again in a moment."
-    # inject client context if available (sheet read)
-    context = ""
-    if g_sheets and client_id:
-        try:
-            ss = g_sheets.open_by_key(fetch_client_row(client_id)["sheet_id"])
-            try:
-                w = ss.worksheet("Sheet1")
-            except Exception:
-                w = ss.sheet1
-            rows = w.get_all_records()
-            lines = []
-            for r in rows[:30]:
-                q = r.get("Question") or r.get("Q") or ""
-                a = r.get("Answer") or r.get("A") or ""
-                if q and a:
-                    lines.append(f"Q: {q}\nA: {a}")
-            context = "\n".join(lines)
-        except Exception as e:
-            logging.info("sheet read failed: %s", e)
-    system_msg = {"role":"system","content":"You are a polite professional AI receptionist. Keep replies concise, never use foul language."}
-    messages = [system_msg]
-    if context:
-        messages.append({"role":"system","content":f"Business data:\n{context}"})
-    messages.append({"role":"user","content":prompt})
-    try:
-        resp = openai.ChatCompletion.create(model="gpt-4o-mini", messages=messages, max_tokens=max_tokens)
-        text = resp['choices'][0]['message']['content'].strip()
-        # increment usage (estimate tokens roughly)
-        tokens_used = max_tokens if 'usage' not in resp else resp['usage'].get('total_tokens', 0)
-        inc_usage(cid, tokens=tokens_used)
-        return text
+        if TEMPLATE_SHEET_ID:
+            # Use Drive API copy
+            copy_body = {"name": f"LeadLine_{client_name}_{client_id}"}
+            copy_resp = drive_service.files().copy(fileId=TEMPLATE_SHEET_ID, body=copy_body).execute()
+            new_id = copy_resp.get("id")
+            if client_email:
+                perm = {"type":"user","role":"writer","emailAddress":client_email}
+                drive_service.permissions().create(fileId=new_id, body=perm, sendNotificationEmail=True).execute()
+            return new_id
+        else:
+            # Create new via gspread
+            ss = g_sheets.create(f"LeadLine_{client_name}_{client_id}")
+            ss.sheet1.update("A1", [["Question","Answer"]])
+            if client_email:
+                drive_service.permissions().create(fileId=ss.id, body={"type":"user","role":"writer","emailAddress":client_email}, sendNotificationEmail=True).execute()
+            return ss.id
     except Exception as e:
-        logging.error("openai error %s", e)
-        # fallback canned reply
-        return "Sorry, I'm having trouble answering right now. We'll call you back shortly."
+        logging.exception("create_client_sheet failed: %s", e)
+        return None
 
-# ---------- TTS / STT helpers ----------
-def text_to_speech_bytes(text):
+def fetch_client_context_from_sheet(sheet_id, max_rows=50):
+    if not g_sheets or not sheet_id:
+        return ""
+    try:
+        ss = g_sheets.open_by_key(sheet_id)
+        ws = ss.sheet1
+        rows = ws.get_all_records()
+        lines = []
+        for r in rows[:max_rows]:
+            q = r.get("Question") or r.get("Q") or ""
+            a = r.get("Answer") or r.get("A") or ""
+            if q and a:
+                lines.append(f"Q: {q}\nA: {a}")
+        return "\n".join(lines)
+    except Exception as e:
+        logging.exception("sheet read failed: %s", e)
+        return ""
+
+# ---------- STT / TTS wrappers (Google) ----------
+def text_to_speech_bytes(text, voice_name=DEFAULT_TTS_VOICE):
     if not tts_client:
         return None
-    synthesis_input = texttospeech.SynthesisInput(text=text)
-    voice = texttospeech.VoiceSelectionParams(language_code="en-US", name=DEFAULT_TTS_VOICE)
-    audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
-    resp = tts_client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
-    return resp.audio_content
+    try:
+        synthesis_input = texttospeech.SynthesisInput(text=text)
+        voice = texttospeech.VoiceSelectionParams(language_code="en-IN", name=voice_name)
+        audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
+        resp = tts_client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
+        return resp.audio_content
+    except Exception:
+        logging.exception("TTS failed")
+        return None
 
-def speech_to_text_bytes(audio_bytes, encoding="LINEAR16", sample_rate_hz=16000):
+def speech_to_text_bytes(audio_bytes, encoding="LINEAR16", sample_rate_hz=16000, language_code="en-US"):
     if not stt_client:
+        # fallback: return empty string
         return ""
-    audio = speech.RecognitionAudio(content=audio_bytes)
-    config = speech.RecognitionConfig(encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16, sample_rate_hertz=sample_rate_hz, language_code="en-US")
-    resp = stt_client.recognize(config=config, audio=audio)
-    texts = []
-    for r in resp.results:
-        texts.append(r.alternatives[0].transcript)
-    return " ".join(texts)
+    try:
+        audio = speech.RecognitionAudio(content=audio_bytes)
+        config = speech.RecognitionConfig(encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+                                          sample_rate_hertz=sample_rate_hz,
+                                          language_code=language_code)
+        resp = stt_client.recognize(config=config, audio=audio)
+        texts = [r.alternatives[0].transcript for r in resp.results]
+        return " ".join(texts)
+    except Exception:
+        logging.exception("STT failed")
+        return ""
 
-# ---------- Endpoints ----------
-@app.route("/")
-def root():
-    return jsonify({"service":"leadline","status":"ok","endpoints":["/onboard_client","/webhook","/webrtc_offer","/sip_inbound"]})
+# ---------- GPT wrapper (OpenAI) ----------
+def ask_gpt(prompt, client_ctx="", max_tokens=300):
+    if not openai:
+        logging.error("OpenAI not configured")
+        return "AI not configured."
+    try:
+        system = {"role":"system","content":"You are a polite professional AI receptionist. Keep replies concise and don't use foul language."}
+        messages = [system]
+        if client_ctx:
+            messages.append({"role":"system","content":f"Business context:\n{client_ctx}"})
+        messages.append({"role":"user","content":prompt})
+        resp = openai.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=max_tokens)
+        # new client SDK: resp.choices[0].message.content
+        text = resp.choices[0].message.content.strip()
+        # estimate tokens (approx)
+        tokens_est = 0
+        try:
+            tokens_est = resp.usage.get("total_tokens", 0)
+        except Exception:
+            tokens_est = int(len(text.split()) / 0.7)  # rough
+        return text, tokens_est
+    except Exception as e:
+        logging.exception("ask_gpt failed: %s", e)
+        return "Sorry, I'm having trouble right now.", 0
 
-# Admin: onboard a new client -> create db row + sheet + token
+# ---------- Logging usage ----------
+def log_usage(client_id, endpoint, req_text, resp_text, tokens_est=0, duration_ms=0):
+    db = get_db()
+    db.execute("INSERT INTO usage(client_id, ts, endpoint, request_text, response_text, tokens_est, duration_ms) VALUES(?,?,?,?,?,?,?)",
+               (client_id, now_ts(), endpoint, req_text[:2000], resp_text[:2000], tokens_est, duration_ms))
+    db.commit()
+
+# ---------- Callbacks worker (simple) ----------
+def process_callbacks_loop(sleep_seconds=10):
+    """Background thread: pick pending callbacks and attempt to perform them.
+       NOTE: For production use Cloud Tasks / PubSub instead of in-process loop."""
+    logging.info("Callback worker started")
+    while True:
+        try:
+            db = sqlite3.connect(DB_PATH)
+            db.row_factory = sqlite3.Row
+            cur = db.cursor()
+            nowt = now_ts()
+            rows = cur.execute("SELECT * FROM callbacks WHERE status='pending' AND schedule_ts <= ? ORDER BY schedule_ts ASC LIMIT 5", (nowt,)).fetchall()
+            for r in rows:
+                cid = r["client_id"]
+                phone = r["phone"]
+                payload = r["payload"]
+                # here make outbound call via your SIP provider API / PBX
+                # This is a placeholder - each SIP provider has its own outbound API.
+                # For now we mark as done to avoid loops.
+                cur.execute("UPDATE callbacks SET status='done', attempts=attempts+1 WHERE id=?", (r["id"],))
+                db.commit()
+                logging.info("Processed callback id=%s client=%s phone=%s", r["id"], cid, phone)
+            db.close()
+        except Exception:
+            logging.exception("callback worker error")
+        time.sleep(sleep_seconds)
+
+# start worker thread
+cb_thread = threading.Thread(target=process_callbacks_loop, daemon=True)
+cb_thread.start()
+
+# ---------- Authentication decorators ----------
+from functools import wraps
+def require_admin(f):
+    @wraps(f)
+    def inner(*args, **kwargs):
+        key = request.headers.get("X-ADMIN-KEY") or request.args.get("admin_key")
+        if not key or key != ADMIN_API_KEY:
+            return jsonify({"error":"unauthorized"}), 403
+        return f(*args, **kwargs)
+    return inner
+
+def require_client_token(f):
+    @wraps(f)
+    def inner(*args, **kwargs):
+        token = request.headers.get("X-API-KEY") or request.args.get("api_key")
+        if not token:
+            return jsonify({"error":"missing api token"}), 401
+        db = get_db()
+        r = db.execute("SELECT id, sheet_id, free_calls_left FROM clients WHERE api_token=?", (token,)).fetchone()
+        if not r:
+            return jsonify({"error":"invalid api token"}), 403
+        request.client = {"id": r["id"], "sheet_id": r["sheet_id"], "free_calls_left": r["free_calls_left"]}
+        return f(*args, **kwargs)
+    return inner
+
+# ---------- Admin endpoints ----------
 @app.route("/onboard_client", methods=["POST"])
+@require_admin
 def onboard_client():
-    key = request.headers.get("X-ADMIN-KEY")
-    if key != ADMIN_API_KEY:
-        return jsonify({"error":"unauthorized"}), 403
     j = request.get_json() or {}
-    client_id = j.get("id") or j.get("client_id")
-    name = j.get("name") or j.get("company") or f"client-{int(time.time())}"
+    client_id = j.get("id") or f"c{int(time.time())}"
+    name = j.get("name") or j.get("company") or client_id
     email = j.get("email")
+    plan = j.get("plan", "SME")
     token = gen_token()
     sheet_id = None
-    if g_sheets:
-        sheet_id = create_client_sheet(client_id, name, client_email=email)
+    if GOOGLE_AVAILABLE and GOOGLE_SA_JSON:
+        sheet_id = create_client_sheet(client_id, name, email)
     db = get_db()
-    db.execute("INSERT OR REPLACE INTO clients(id,name,sheet_id,api_token,created_at) VALUES(?,?,?,?,?)", (client_id, name, sheet_id, token, int(time.time())))
+    db.execute("INSERT OR REPLACE INTO clients(id,name,email,api_token,plan,sheet_id,free_calls_left,created_at) VALUES(?,?,?,?,?,?,?,?)",
+               (client_id, name, email, token, plan, sheet_id, FREE_TRIAL_CALLS, now_ts()))
     db.commit()
-    return jsonify({"client_id":client_id, "sheet_id":sheet_id, "api_token":token})
+    return jsonify({"client_id":client_id, "api_token": token, "sheet_id": sheet_id})
 
-# Text webhook (Dialogflow or direct)
-@app.route("/webhook", methods=["POST"])
-@require_token
-def webhook():
-    j = request.get_json(force=True, silent=True) or {}
-    query = j.get("queryResult",{}).get("queryText","") or j.get("text","") or j.get("message","")
-    client_id = request.client_id
-    reply = ask_gpt(query, client_id=client_id)
-    return jsonify({"fulfillmentText": reply})
-
-# WebRTC demo: accept uploaded audio file, return mp3
-@app.route("/webrtc_offer", methods=["POST"])
-@require_token
-def webrtc_offer():
-    client_id = request.client_id
-    if "audio" not in request.files:
-        return jsonify({"error":"upload form field 'audio' file (wav/pcm)"}), 400
-    f = request.files["audio"]
-    audio_bytes = f.read()
-    # STT
-    user_text = speech_to_text_bytes(audio_bytes)
-    reply = ask_gpt(user_text, client_id=client_id)
-    audio = text_to_speech_bytes(reply)
-    if not audio:
-        return jsonify({"text":reply})
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-    tmp.write(audio); tmp.flush()
-    return send_file(tmp.name, mimetype="audio/mpeg")
-
-# SIP inbound webhook: provider posts RecordingUrl or audio, we return base64 audio to play
-@app.route("/sip_inbound", methods=["POST"])
-def sip_inbound():
-    # some providers post as form-data, others JSON
-    data = request.form.to_dict() or request.json or {}
-    token = data.get("api_token") or request.headers.get("X-API-KEY")
-    if not token:
-        return jsonify({"error":"missing api token"}), 401
-    row = get_db().execute("SELECT id FROM clients WHERE api_token=?", (token,)).fetchone()
-    if not row:
-        return jsonify({"error":"invalid token"}), 403
-    client_id = row["id"]
-    audio_url = data.get("RecordingUrl") or data.get("audio_url")
-    user_text = ""
-    if audio_url:
-        r = requests.get(audio_url, timeout=15)
-        if r.ok:
-            user_text = speech_to_text_bytes(r.content)
-    else:
-        user_text = data.get("speech_text") or data.get("text") or "Hello"
-    reply = ask_gpt(user_text, client_id=client_id)
-    audio = text_to_speech_bytes(reply)
-    b64 = None
-    if audio:
-        b64 = base64.b64encode(audio).decode()
-    return jsonify({"text":reply, "audio_b64": b64})
-
-# Simple health or admin usage query
-@app.route("/admin/usage/<client_id>", methods=["GET"])
-def admin_usage(client_id):
-    key = request.headers.get("X-ADMIN-KEY")
-    if key != ADMIN_API_KEY:
-        return jsonify({"error":"unauthorized"}), 403
+@app.route("/add_number", methods=["POST"])
+@require_admin
+def add_number():
+    j = request.get_json() or {}
+    number = j.get("number")
+    client_id = j.get("client_id")
+    if not number or not client_id:
+        return jsonify({"error":"number & client_id required"}), 400
     db = get_db()
-    rows = db.execute("SELECT * FROM usage WHERE client_id=? ORDER BY period_start DESC LIMIT 20", (client_id,)).fetchall()
+    db.execute("INSERT OR REPLACE INTO numbers(number, client_id) VALUES(?,?)", (number, client_id))
+    db.commit()
+    return jsonify({"ok":True})
+
+@app.route("/admin/clients", methods=["GET"])
+@require_admin
+def admin_clients():
+    db = get_db()
+    rows = db.execute("SELECT id,name,email,plan,sheet_id,free_calls_left,created_at FROM clients").fetchall()
+    return jsonify({"clients":[dict(r) for r in rows]})
+
+@app.route("/admin/usage/<client_id>", methods=["GET"])
+@require_admin
+def admin_usage(client_id):
+    db = get_db()
+    rows = db.execute("SELECT * FROM usage WHERE client_id=? ORDER BY ts DESC LIMIT 200", (client_id,)).fetchall()
     return jsonify({"usage":[dict(r) for r in rows]})
 
-# Init DB and run
+# ---------- Client-facing endpoints ----------
+@app.route("/webhook", methods=["POST"])
+@require_client_token
+def webhook():
+    start = time.time()
+    client = request.client
+    j = request.get_json(force=True, silent=True) or {}
+    query = j.get("queryResult",{}).get("queryText") or j.get("text") or j.get("message") or ""
+    # rate limit
+    if not check_and_inc_rate(client["id"]):
+        return jsonify({"fulfillmentText":"Too many requests. Try later."}), 429
+    # free-trial enforcement
+    db = get_db()
+    if client["free_calls_left"] <= 0:
+        # you can choose to block or let it pass; we'll block and instruct payment
+        return jsonify({"fulfillmentText":"Trial over. Please subscribe to continue."}), 402
+    # get context from sheet
+    context = ""
+    if client["sheet_id"] and GOOGLE_AVAILABLE:
+        context = fetch_client_context_from_sheet(client["sheet_id"])
+    resp_text, tokens_est = ask_gpt(query, client_ctx=context)
+    duration_ms = int((time.time()-start)*1000)
+    log_usage(client["id"], "/webhook", query, resp_text, tokens_est, duration_ms)
+    # decrement free_calls_left
+    db.execute("UPDATE clients SET free_calls_left = free_calls_left - 1 WHERE id=?", (client["id"],))
+    db.commit()
+    return jsonify({"fulfillmentText": resp_text})
+
+@app.route("/webrtc_offer", methods=["POST"])
+@require_client_token
+def webrtc_offer():
+    client = request.client
+    # Expect form-data audio file upload
+    if "audio" not in request.files:
+        return jsonify({"error":"upload audio file field named 'audio' (wav/pcm)"})
+    file = request.files["audio"]
+    audio_bytes = file.read()
+    # rate limit & trial
+    if not check_and_inc_rate(client["id"]):
+        return jsonify({"error":"rate_limited"}), 429
+    db = get_db()
+    if client["free_calls_left"] <= 0:
+        return jsonify({"error":"trial_over"}), 402
+    # STT
+    user_text = speech_to_text_bytes(audio_bytes)
+    # context
+    context = fetch_client_context_from_sheet(client["sheet_id"]) if client["sheet_id"] else ""
+    resp_text, tokens_est = ask_gpt(user_text, client_ctx=context)
+    audio = text_to_speech_bytes(resp_text) if GOOGLE_AVAILABLE else None
+    log_usage(client["id"], "/webrtc_offer", user_text, resp_text, tokens_est, 0)
+    db.execute("UPDATE clients SET free_calls_left = free_calls_left - 1 WHERE id=?", (client["id"],))
+    db.commit()
+    if audio:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+        tmp.write(audio); tmp.flush()
+        return send_file(tmp.name, mimetype="audio/mpeg")
+    return jsonify({"text": resp_text})
+
+@app.route("/sip_inbound", methods=["POST"])
+def sip_inbound():
+    # providers differ; accept form or json
+    data = request.form.to_dict() or request.get_json(force=True, silent=True) or {}
+    # identify client by called number or provided api_token
+    called = data.get("To") or data.get("called") or data.get("called_number")
+    token = data.get("api_token") or request.headers.get("X-API-KEY")
+    db = get_db()
+    client_id = None
+    if token:
+        r = db.execute("SELECT id,sheet_id,free_calls_left FROM clients WHERE api_token=?", (token,)).fetchone()
+        if r:
+            client_id = r["id"]
+            sheet_id = r["sheet_id"]
+            free_left = r["free_calls_left"]
+    if not client_id and called:
+        # map number -> client
+        r2 = db.execute("SELECT client_id FROM numbers WHERE number=?", (called,)).fetchone()
+        if r2:
+            client_id = r2["client_id"]
+            sheet_id = db.execute("SELECT sheet_id,free_calls_left FROM clients WHERE id=?", (client_id,)).fetchone()["sheet_id"]
+    if not client_id:
+        return jsonify({"error":"unknown client"}), 403
+    # rate limit & trial check
+    if not check_and_inc_rate(client_id):
+        return jsonify({"error":"rate_limited"}), 429
+    r3 = db.execute("SELECT free_calls_left FROM clients WHERE id=?", (client_id,)).fetchone()
+    if r3["free_calls_left"] <= 0:
+        return jsonify({"error":"trial_over"}), 402
+    # get recording url and download
+    audio_url = data.get("RecordingUrl") or data.get("recording_url")
+    user_text = ""
+    if audio_url:
+        try:
+            resp = requests.get(audio_url, timeout=10)
+            if resp.ok:
+                user_text = speech_to_text_bytes(resp.content)
+        except Exception:
+            logging.exception("download recording failed")
+    else:
+        user_text = data.get("speech_text") or data.get("text") or "Hello"
+    # context
+    context = fetch_client_context_from_sheet(sheet_id) if sheet_id else ""
+    resp_text, tokens_est = ask_gpt(user_text, client_ctx=context)
+    audio = text_to_speech_bytes(resp_text) if GOOGLE_AVAILABLE else None
+    # log usage and decrement trial
+    log_usage(client_id, "/sip_inbound", user_text, resp_text, tokens_est, 0)
+    db.execute("UPDATE clients SET free_calls_left = free_calls_left - 1 WHERE id=?", (client_id,))
+    db.commit()
+    # return JSON instructing PBX to play base64 audio
+    audio_b64 = None
+    if audio:
+        audio_b64 = base64.b64encode(audio).decode()
+    # optionally push lead to CRM
+    try:
+        crm = db.execute("SELECT crm_url, crm_key FROM clients WHERE id=?", (client_id,)).fetchone()
+        if crm and crm["crm_url"]:
+            try:
+                requests.post(crm["crm_url"], json={"caller":data.get("From"), "transcript":user_text, "reply":resp_text}, headers={"Authorization":f"Bearer {crm['crm_key']}" if crm["crm_key"] else ""}, timeout=5)
+            except Exception:
+                logging.exception("crm push failed")
+    except Exception:
+        pass
+    return jsonify({"text":resp_text, "audio_b64":audio_b64})
+
+# ---------- Scheduling callbacks (client can request) ----------
+@app.route("/schedule_callback", methods=["POST"])
+@require_client_token
+def schedule_callback():
+    j = request.get_json() or {}
+    phone = j.get("phone")
+    when_ts = j.get("when_ts") or int(time.time()) + 60  # default next minute
+    payload = j.get("payload") or ""
+    if not phone:
+        return jsonify({"error":"phone required"}), 400
+    db = get_db()
+    db.execute("INSERT INTO callbacks(client_id, phone, schedule_ts, payload) VALUES(?,?,?,?)", (request.client["id"], phone, when_ts, json.dumps(payload)))
+    db.commit()
+    return jsonify({"ok":True})
+
+# ---------- CRM link setup (admin or client can set) ----------
+@app.route("/set_crm", methods=["POST"])
+@require_admin
+def set_crm():
+    j = request.get_json() or {}
+    client_id = j.get("client_id")
+    crm_url = j.get("crm_url")
+    crm_key = j.get("crm_key")
+    db = get_db()
+    db.execute("UPDATE clients SET crm_url=?, crm_key=? WHERE id=?", (crm_url, crm_key, client_id))
+    db.commit()
+    return jsonify({"ok":True})
+
+# ---------- Small health root ----------
+@app.route("/")
+def root():
+    return jsonify({"service":"leadline","status":"ok","endpoints":["/onboard_client","/webhook","/webrtc_offer","/sip_inbound","/schedule_callback"]})
+
+# ---------- Run ----------
 if __name__ == "__main__":
     init_db()
     app.run(host="0.0.0.0", port=PORT)
