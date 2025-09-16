@@ -1,18 +1,17 @@
 # main.py
 """
-Single-file Flask app for LeadLine webhook + SIP inbound + simple WebRTC test.
-Replace your existing main.py with this file and set env vars in Cloud Run.
-Env vars:
-  OPENAI_API_KEY
-  GOOGLE_SA_JSON        - base64(service-account.json) optional (for Google TTS/STT/Sheets/Storage)
-  SHEET_ID              - optional Google Sheets
+Single-file Flask app for LeadLine webhook + SIP + WebRTC test with GCS upload.
+Paste as-is. Set these env vars on Cloud Run:
+  OPENAI_API_KEY        - your OpenAI API key (secret)
+  GOOGLE_SA_JSON        - base64-encoded service account JSON (for Google TTS/STT/Sheets/Storage)
+  GCS_BUCKET            - GCS bucket name to upload MP3s (optional)
+  SHEET_ID              - (optional) Google Sheets file ID (one file with tabs per client_id)
   DEFAULT_TTS_VOICE     - e.g. "en-IN-Wavenet-C"
-  PERSONALAR_ALLOWLIST  - comma-separated numbers (bypass AI and forward to OWNER_NUMBER)
-  OWNER_NUMBER          - phone number to forward allowlisted calls to
-  PORT                  - optional
+  PORT                  - (optional) container port (Cloud Run provides)
+  SIGNED_URL_EXPIRATION - signed URL TTL seconds (default 300)
 """
 
-import os, json, base64, tempfile, traceback
+import os, json, base64, tempfile, traceback, time, uuid
 from flask import Flask, request, jsonify, send_file
 import requests
 
@@ -35,9 +34,8 @@ GOOGLE_SA_JSON  = os.getenv("GOOGLE_SA_JSON")    # base64 of service account JSO
 SHEET_ID        = os.getenv("SHEET_ID")          # google sheet id (optional)
 TTS_VOICE       = os.getenv("DEFAULT_TTS_VOICE", "en-IN-Wavenet-C")
 PORT            = int(os.getenv("PORT", 8080))
-PERSONALAR_ALLOWLIST = os.getenv("PERSONALAR_ALLOWLIST", "")  # comma separated
-OWNER_NUMBER    = os.getenv("OWNER_NUMBER", "")              # where to forward allowlist callers
-GCS_BUCKET      = os.getenv("GCS_BUCKET")                    # optional: to save audio for training
+GCS_BUCKET      = os.getenv("GCS_BUCKET")        # e.g. gcs_bucket02
+SIGNED_URL_EXPIRATION = int(os.getenv("SIGNED_URL_EXPIRATION", "300"))
 # ----------------------------
 
 app = Flask(__name__)
@@ -46,29 +44,40 @@ app = Flask(__name__)
 g_tts = None
 g_stt = None
 g_sheet = None
-g_storage = None
-if GOOGLE_SA_JSON and texttospeech and speech and service_account:
+gcs_client = None
+creds_info = None
+
+if GOOGLE_SA_JSON:
     try:
-        sa_json = base64.b64decode(GOOGLE_SA_JSON)
-        creds_info = json.loads(sa_json)
+        sa_raw = base64.b64decode(GOOGLE_SA_JSON)
+        creds_info = json.loads(sa_raw)
+    except Exception as e:
+        app.logger.warning("Failed to decode GOOGLE_SA_JSON: %s" % e)
+        creds_info = None
+
+if creds_info and service_account:
+    try:
         creds = service_account.Credentials.from_service_account_info(creds_info)
-        g_tts = texttospeech.TextToSpeechClient(credentials=creds) if texttospeech else None
-        g_stt = speech.SpeechClient(credentials=creds) if speech else None
+        if texttospeech:
+            g_tts = texttospeech.TextToSpeechClient(credentials=creds)
+        if speech:
+            g_stt = speech.SpeechClient(credentials=creds)
         if gspread and SHEET_ID:
             gc = gspread.authorize(creds)
             g_sheet = gc.open_by_key(SHEET_ID)
         if storage:
-            g_storage = storage.Client(credentials=creds, project=creds_info.get("project_id"))
+            # storage client can be created from service account info
+            gcs_client = storage.Client.from_service_account_info(creds_info)
     except Exception as e:
         app.logger.warning("Google clients init failed: %s" % e)
 else:
     if GOOGLE_SA_JSON:
-        app.logger.warning("Google libs not installed or missing; GCP features disabled.")
+        app.logger.warning("Google libs not installed or missing dependencies; GCP features disabled.")
 
 # ---------- Helpers ----------
 def call_openai_chat(prompt, client_id=None, model="gpt-4o-mini", max_tokens=300):
     """
-    Call OpenAI Chat Completions via REST (requests).
+    Use OpenAI REST ChatCompletions endpoint via requests.
     """
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not set")
@@ -98,9 +107,6 @@ def call_openai_chat(prompt, client_id=None, model="gpt-4o-mini", max_tokens=300
     return text
 
 def fetch_client_context(client_id):
-    """
-    Read small Q/A from Google Sheet tab named client_id or 'default'.
-    """
     if not g_sheet:
         return ""
     try:
@@ -128,8 +134,14 @@ def synthesize_text_to_mp3_bytes(text):
         return None
     try:
         synthesis_input = texttospeech.SynthesisInput(text=text)
-        # voice.name expects something like "en-IN-Wavenet-C" — TTS_VOICE env var used
-        voice = texttospeech.VoiceSelectionParams(name=TTS_VOICE, language_code="en-US")
+        # try to infer language_code from voice name prefix if possible
+        language_code = "en-US"
+        if "-" in TTS_VOICE:
+            parts = TTS_VOICE.split("-")
+            if len(parts) >= 2:
+                # e.g. en-IN-Wavenet-C -> en-IN
+                language_code = f"{parts[0]}-{parts[1]}"
+        voice = texttospeech.VoiceSelectionParams(name=TTS_VOICE, language_code=language_code)
         audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
         response = g_tts.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
         return response.audio_content
@@ -139,7 +151,7 @@ def synthesize_text_to_mp3_bytes(text):
 
 def speech_bytes_to_text(audio_bytes, encoding="LINEAR16", sample_rate_hz=16000):
     """
-    Convert audio bytes to text using Google STT if configured.
+    Convert raw audio bytes (PCM/WAV) to text using Google STT (if configured).
     """
     if not g_stt:
         return ""
@@ -157,20 +169,47 @@ def speech_bytes_to_text(audio_bytes, encoding="LINEAR16", sample_rate_hz=16000)
         app.logger.warning("STT failed: %s" % e)
         return ""
 
-def save_audio_to_gcs(filename, data_bytes):
+# ---------- GCS helpers ----------
+def upload_bytes_to_gcs(bucket_name, blob_name, data_bytes, content_type="audio/mpeg"):
     """
-    Optional: save audio bytes to GCS bucket for future training.
+    Upload bytes to GCS and return uploaded blob name. Requires gcs_client.
     """
-    if not g_storage or not GCS_BUCKET:
+    if not gcs_client:
+        raise RuntimeError("GCS client not initialized")
+    bucket = gcs_client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_string(data_bytes, content_type=content_type)
+    return blob.name
+
+def generate_signed_url(bucket_name, blob_name, expires_in=SIGNED_URL_EXPIRATION):
+    """
+    Returns a signed URL valid for expires_in seconds.
+    """
+    if not gcs_client:
+        raise RuntimeError("GCS client not initialized")
+    bucket = gcs_client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    # generate_signed_url exists in google-cloud-storage
+    url = blob.generate_signed_url(expiration=expires_in)
+    return url
+
+def synthesize_and_upload(text, filename_prefix="reply"):
+    """
+    Synthesize via Google TTS and upload to GCS; return signed URL or None.
+    """
+    mp3_bytes = synthesize_text_to_mp3_bytes(text)
+    if not mp3_bytes:
         return None
+    if not GCS_BUCKET:
+        app.logger.warning("GCS_BUCKET not set - returning mp3 bytes only")
+        return None
+    fname = f"{filename_prefix}_{int(time.time())}_{uuid.uuid4().hex[:8]}.mp3"
     try:
-        bucket = g_storage.bucket(GCS_BUCKET)
-        blob = bucket.blob(filename)
-        blob.upload_from_string(data_bytes, content_type="audio/mpeg")
-        # return public-ish path (not signed) — adjust per your policy
-        return f"gs://{GCS_BUCKET}/{filename}"
+        upload_bytes_to_gcs(GCS_BUCKET, fname, mp3_bytes, content_type="audio/mpeg")
+        signed = generate_signed_url(GCS_BUCKET, fname)
+        return signed
     except Exception as e:
-        app.logger.warning("GCS save failed: %s" % e)
+        app.logger.error("upload or signed url failed: %s" % e)
         return None
 
 # ----------------------------
@@ -182,9 +221,6 @@ def root():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """
-    Generic Dialogflow/Web UI webhook (text-based).
-    """
     try:
         j = request.get_json(silent=True) or {}
         query_text = ""
@@ -208,71 +244,45 @@ def webhook():
 @app.route("/sip_inbound", methods=["POST"])
 def sip_inbound():
     """
-    SIP inbound webhook:
-    - If caller in PERSONALAR_ALLOWLIST -> forward to OWNER_NUMBER (bypass AI)
-    - Else -> STT -> GPT -> TTS -> return base64 MP3 for provider to play
-    Response (JSON):
-      {"action":"play_audio_base64","audio_b64":"...","text":"..."}
-      or
-      {"action":"forward","forward_to":"..."}
+    SIP/PBX webhook:
+    - Accepts form-data or JSON
+    - If provider gives a recording URL, downloads it and STT -> GPT -> TTS -> return signed audio URL
+    Response:
+      1) {"action":"play_audio_url","audio_url": "...", "text":"..."}  OR
+      2) {"action":"play_audio_base64","audio_b64":"...", "text":"..."}
     """
     try:
         data = request.form.to_dict() or request.get_json(silent=True) or {}
         caller = data.get("From") or data.get("caller") or data.get("Caller") or "unknown"
         call_id = data.get("CallSid") or data.get("call_id") or "cid"
-
-        # prepare allowlist
-        allowed_numbers = [n.strip() for n in PERSONALAR_ALLOWLIST.split(",") if n.strip()]
-
-        # If caller is explicitly allowlisted and we have an owner number -> forward call
-        if caller in allowed_numbers and OWNER_NUMBER:
-            return jsonify({
-                "call_id": call_id,
-                "action": "forward",
-                "forward_to": OWNER_NUMBER,
-                "text": f"Forwarding call from {caller} to owner."
-            })
-
-        # Else handle by AI
         audio_url = data.get("RecordingUrl") or data.get("audio_url")
         user_text = ""
         if audio_url:
             try:
                 r = requests.get(audio_url, timeout=20)
                 if r.status_code == 200:
-                    # note: provider may give mp3/wav; speech_bytes_to_text expects PCM LINEAR16
-                    # best-effort: pass raw bytes to STT (Google may or may not accept mp3 here).
-                    user_text = speech_bytes_to_text(r.content) or ""
+                    user_text = speech_bytes_to_text(r.content)
             except Exception as e:
-                app.logger.warning("failed download recording: %s" % e)
-
-        if not user_text:
+                app.logger.warning("download recording failed: %s" % e)
+        else:
             user_text = data.get("speech_text") or data.get("transcript") or data.get("text") or "Hello"
-
         client_id = data.get("client_id") or data.get("ClientId")
         answer = call_openai_chat(user_text, client_id=client_id)
-
-        # TTS
-        audio_bytes = synthesize_text_to_mp3_bytes(answer)
-        audio_b64 = None
-        if audio_bytes:
-            # optionally save to GCS for training/records
-            try:
-                # unique-ish filename
-                fname = f"call_{call_id[:64]}_{int(__import__('time').time())}.mp3"
-                gcs_path = save_audio_to_gcs(fname, audio_bytes) if GCS_BUCKET else None
-                if gcs_path:
-                    app.logger.info("Saved audio to %s" % gcs_path)
-            except Exception:
-                app.logger.warning("save to GCS failed")
-            audio_b64 = base64.b64encode(audio_bytes).decode()
-
-        return jsonify({
-            "call_id": call_id,
-            "action": "play_audio_base64",
-            "audio_b64": audio_b64,
-            "text": answer
-        })
+        # Try upload-and-return-signed-url first
+        signed_url = None
+        try:
+            signed_url = synthesize_and_upload(answer, filename_prefix=f"call_{call_id}")
+        except Exception as e:
+            app.logger.warning("synth+upload failed: %s" % e)
+            signed_url = None
+        if signed_url:
+            return jsonify({"call_id":call_id, "action":"play_audio_url", "audio_url": signed_url, "text": answer})
+        else:
+            audio_bytes = synthesize_text_to_mp3_bytes(answer)
+            audio_b64 = None
+            if audio_bytes:
+                audio_b64 = base64.b64encode(audio_bytes).decode()
+            return jsonify({"call_id":call_id, "action":"play_audio_base64", "audio_b64": audio_b64, "text": answer})
     except Exception as e:
         app.logger.error(traceback.format_exc())
         return jsonify({"error":"internal"}), 500
@@ -280,7 +290,8 @@ def sip_inbound():
 @app.route("/webrtc_offer", methods=["POST"])
 def webrtc_offer():
     """
-    Quick test: POST form-data 'audio' (file) to get STT->GPT->TTS MP3 file back.
+    Accept an uploaded audio file (form-data 'audio') then:
+      - STT -> GPT -> TTS -> returns MP3 file for playback (send_file)
     """
     try:
         if "audio" not in request.files:
@@ -290,6 +301,15 @@ def webrtc_offer():
         user_text = speech_bytes_to_text(audio_bytes) or "Hello"
         client_id = request.form.get("client_id")
         reply = call_openai_chat(user_text, client_id=client_id)
+        # attempt to upload to GCS and return signed url
+        signed = None
+        try:
+            signed = synthesize_and_upload(reply, filename_prefix="webrtc")
+        except Exception as e:
+            app.logger.warning("webrtc synth+upload failed: %s" % e)
+            signed = None
+        if signed:
+            return jsonify({"text": reply, "audio_url": signed})
         mp3_bytes = synthesize_text_to_mp3_bytes(reply)
         if not mp3_bytes:
             return jsonify({"text": reply})
