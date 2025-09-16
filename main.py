@@ -18,7 +18,7 @@ OWNER_NUMBER = os.getenv("OWNER_NUMBER", "")                    # optional
 SIGNED_URL_MINUTES = int(os.getenv("SIGNED_URL_MINUTES", "15"))
 # ------------------------
 
-# Google TTS client
+# Google clients
 tts_client = texttospeech.TextToSpeechClient()
 storage_client = storage.Client()
 
@@ -53,21 +53,25 @@ def make_signed_url_for_blob(blob, minutes: int) -> str:
         service_account_email=SIGNING_SERVICE_ACCOUNT or None,
     )
 
-@app.route("/sip_inbound", methods=["POST"])
+@app.route("/sip_inbound", methods=["GET", "POST"])
 def sip_inbound():
     try:
-        call_sid = request.form.get("CallSid") or ""
-        from_num = request.form.get("From") or ""
-        text = request.form.get("text") or request.form.get("Text") or "Hello"
-        client_id = request.form.get("client_id") or ""
+        # support both GET & POST (Exotel Passthru uses GET)
+        data = request.form if request.method == "POST" else request.args
 
-        logging.info("Incoming call: CallSid=%s From=%s client_id=%s", call_sid, from_num, client_id)
+        call_sid = data.get("CallSid") or ""
+        from_num = data.get("From") or ""
+        text = data.get("text") or data.get("Text") or "Hello"
+        client_id = data.get("client_id") or ""
+
+        logging.info("Incoming call: CallSid=%s From=%s client_id=%s Text=%s",
+                     call_sid, from_num, client_id, text)
 
         # Optional allowlist logic
         if PERSONALAR_ALLOWLIST:
             allowed = [p.strip() for p in PERSONALAR_ALLOWLIST.split(",") if p.strip()]
             if allowed and from_num not in allowed:
-                logging.info("Caller not in allowlist; still proceeding with default flow.")
+                logging.info("Caller not in allowlist; proceeding with default flow.")
 
         # Create TTS
         mp3_bytes = synthesize_text_mp3(text)
