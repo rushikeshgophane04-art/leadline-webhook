@@ -1,113 +1,114 @@
-# main.py
-"""
-LeadLine AI Receptionist
-- Handles Exotel/Plivo SIP inbound
-- Uses OpenAI for reply
-- Uses Google TTS/STT
-- Saves audio to GCS bucket (shareable URL)
-"""
-
-import os, json, base64, tempfile, traceback, uuid
+# main.py - full replacement
+import os
+import time
+import uuid
+from datetime import timedelta
 from flask import Flask, request, jsonify
-import requests
-from google.cloud import texttospeech, speech_v1p1beta1 as speech
-from google.oauth2 import service_account
 from google.cloud import storage
-import gspread
+from google.cloud import texttospeech
 
-# ---------- CONFIG ----------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GOOGLE_SA_JSON  = os.getenv("GOOGLE_SA_JSON")    # base64 service account JSON
-SHEET_ID        = os.getenv("SHEET_ID")          # optional
-TTS_VOICE       = os.getenv("DEFAULT_TTS_VOICE", "en-IN-Wavenet-C")
-GCS_BUCKET      = os.getenv("GCS_BUCKET")        # required for mp3 upload
-OWNER_NUMBER    = os.getenv("OWNER_NUMBER")      # e.g. +919812345678
-PERSONAL_ALLOW  = os.getenv("PERSONAL_ALLOW", "")  # comma-separated allowed numbers
-PORT            = int(os.getenv("PORT", 8080))
-# ----------------------------
+# --- Configuration via env vars ---
+GCS_BUCKET = os.environ.get("GCS_BUCKET", "gcs_bucket02")
+TTS_VOICE = os.environ.get("TTS_VOICE", "en-IN-Wavenet-C")
+TTS_LANGUAGE = os.environ.get("TTS_LANGUAGE", "en-IN")
+SIGNED_URL_EXPIRE_MIN = int(os.environ.get("SIGNED_URL_EXPIRE_MIN", "15"))
 
 app = Flask(__name__)
 
-# ---------- Init Google clients ----------
-creds = None
-if GOOGLE_SA_JSON:
-    sa_json = base64.b64decode(GOOGLE_SA_JSON)
-    creds_info = json.loads(sa_json)
-    creds = service_account.Credentials.from_service_account_info(creds_info)
+# create clients once
+tts_client = texttospeech.TextToSpeechClient()
+storage_client = storage.Client()
 
-g_tts = texttospeech.TextToSpeechClient(credentials=creds)
-g_stt = speech.SpeechClient(credentials=creds)
-gcs_client = storage.Client(credentials=creds)
-g_sheet = None
-if SHEET_ID:
-    gc = gspread.authorize(creds)
-    g_sheet = gc.open_by_key(SHEET_ID)
 
-# ---------- Helpers ----------
-def call_openai_chat(prompt, client_id=None, model="gpt-4o-mini", max_tokens=300):
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY not set")
-
-    system_msg = {"role": "system", "content": "You are a polite professional AI receptionist."}
-    messages = [system_msg, {"role": "user", "content": prompt}]
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    data = {"model": model, "messages": messages, "max_tokens": max_tokens}
-    r = requests.post(url, headers=headers, json=data, timeout=30)
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"].strip()
-
-def synthesize_text_to_mp3_bytes(text):
+def synthesize_text_mp3(text: str) -> bytes:
+    """Synthesize text to MP3 bytes using Google Cloud TTS."""
     synthesis_input = texttospeech.SynthesisInput(text=text)
-    voice = texttospeech.VoiceSelectionParams(name=TTS_VOICE, language_code="en-US")
+
+    # choose voice
+    voice = texttospeech.VoiceSelectionParams(
+        language_code=TTS_LANGUAGE,
+        name=TTS_VOICE
+    )
+
+    # mp3 output
     audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
-    response = g_tts.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
-    return response.audio_content
 
-def upload_mp3_to_gcs(audio_bytes, filename=None):
-    if not filename:
-        filename = f"reply_{uuid.uuid4().hex}.mp3"
-    bucket = gcs_client.bucket(GCS_BUCKET)
-    blob = bucket.blob(filename)
-    blob.upload_from_string(audio_bytes, content_type="audio/mpeg")
-    blob.make_public()
-    return blob.public_url
+    response = tts_client.synthesize_speech(
+        input=synthesis_input,
+        voice=voice,
+        audio_config=audio_config
+    )
+    return response.audio_content  # bytes
 
-# ----------------------------
-# Routes
-# ----------------------------
-@app.route("/")
-def root():
-    return jsonify({"service":"leadline-webhook","status":"ok"})
+
+def upload_bytes_to_gcs_and_get_signed_url(bucket_name: str, dest_name: str, data_bytes: bytes, expire_minutes: int):
+    """
+    Upload bytes to GCS (works with uniform bucket-level access) and return a V4 signed URL.
+    """
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(dest_name)
+
+    # upload
+    blob.upload_from_string(data_bytes, content_type="audio/mpeg")
+
+    # set optional metadata
+    blob.metadata = {"uploaded_at": str(int(time.time()))}
+    blob.patch()
+
+    # generate signed url (V4)
+    url = blob.generate_signed_url(
+        version="v4",
+        expiration=timedelta(minutes=expire_minutes),
+        method="GET"
+    )
+    return url
+
+
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({"service": "leadline-webhook", "status": "ok"}), 200
+
 
 @app.route("/sip_inbound", methods=["POST"])
 def sip_inbound():
+    """
+    ExoTel will POST here.
+    Expected form fields (common):
+      - CallSid
+      - From
+      - text  (optional) -- if provided, we will use this text, else fallback message
+    Response: JSON with keys action/play_audio_url to let ExoTel play the audio.
+    """
     try:
-        data = request.form.to_dict() or request.get_json(silent=True) or {}
-        caller = data.get("From") or "unknown"
+        # read form-data (ExoTel often posts as form data)
+        call_sid = request.form.get("CallSid") or request.values.get("CallSid")
+        from_number = request.form.get("From") or request.values.get("From")
+        text = request.form.get("text") or request.values.get("text") or "Hello, this is an automated assistant. How can I help?"
 
-        # check allow list
-        if OWNER_NUMBER and PERSONAL_ALLOW:
-            allow = [n.strip() for n in PERSONAL_ALLOW.split(",")]
-            if caller not in allow:
-                return jsonify({"call_id": data.get("CallSid","cid"), "action":"hangup"})
+        # synthesize to mp3 bytes
+        mp3_bytes = synthesize_text_mp3(text)
 
-        user_text = data.get("speech_text") or data.get("text") or "Hello"
-        answer = call_openai_chat(user_text)
+        # destination filename unique per call
+        unique_name = f"reply_{uuid.uuid4().hex}.mp3"
 
-        audio_bytes = synthesize_text_to_mp3_bytes(answer)
-        audio_url = upload_mp3_to_gcs(audio_bytes)
+        # upload and get signed URL
+        signed_url = upload_bytes_to_gcs_and_get_signed_url(GCS_BUCKET, unique_name, mp3_bytes, SIGNED_URL_EXPIRE_MIN)
 
-        return jsonify({
-            "call_id": data.get("CallSid","cid"),
+        # ExoTel-friendly JSON response (adjust keys if your flow expects other keys)
+        response_json = {
             "action": "play_audio_url",
-            "audio_url": audio_url,
-            "text": answer
-        })
-    except Exception as e:
-        app.logger.error(traceback.format_exc())
-        return jsonify({"error":"internal"}), 500
+            "url": signed_url,
+            "filename": unique_name,
+            "call_sid": call_sid,
+            "from": from_number
+        }
+        return jsonify(response_json), 200
 
-# ----------------------------
+    except Exception as e:
+        app.logger.exception("Error in /sip_inbound")
+        return jsonify({"error": "internal", "message": str(e)}), 500
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+    # local dev
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
