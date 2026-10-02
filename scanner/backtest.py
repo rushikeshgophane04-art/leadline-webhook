@@ -127,7 +127,7 @@ def main():
     cols = list(GRID) + [c for c in res.columns if c not in GRID]
     res = res[cols]
 
-    default = res[(res.n == 6) & (res.small == 0.6) & (res.near == 0.5)
+    default = res[(res.n == 4) & (res.small == 0.8) & (res.near == 1.2)
                   & (res.big == 1.6) & (res.rr == 2.0)]
     min_trades = MIN_TRADES if (res.train_trades >= MIN_TRADES).any() else 5
     best = (res[res.train_trades >= min_trades]
@@ -138,7 +138,7 @@ def main():
            f"(unseen). R = multiples of risk, after ~2 pip spread.",
            "", "## Top 10 by train total R (min %d trades)" % min_trades,
            best.to_markdown(index=False) if not best.empty else "_none_",
-           "", "## Scanner's current settings (n=6 small=0.6 near=0.5 big=1.6 rr=2)",
+           "", "## Scanner's current settings (n=4 small=0.8 near=1.2 big=1.6 rr=2)",
            default.to_markdown(index=False)]
     text = "\n".join(out)
     print(text)

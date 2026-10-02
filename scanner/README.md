@@ -1,17 +1,23 @@
 # Forex compression scanner
 
-Checks 10 forex pairs on 15-minute candles (free Yahoo Finance data) and sends
-Telegram alerts:
+Checks 10 forex pairs on the **1-hour chart** (free Yahoo Finance data) every
+hour and sends Telegram alerts:
 
-- **WATCH**: the last 6 candles are small (range < 0.6×ATR) and closing within
-  0.5×ATR of the 52 MA. You get one alert per compression run.
-- **SETUP**: compression followed by one big candle (range ≥ 1.5×ATR, body ≥ 60%
+- **WATCH**: 4 small candles in a row (range < 0.8×ATR) closing near the
+  52 MA (within 1.2×ATR). You get one alert per compression run.
+- **SETUP**: compression followed by one big candle (range ≥ 1.6×ATR, body ≥ 60%
   of its range) closing outside the box and on the matching side of the MA.
   Entry is the close, the stop is the far side of the box and the target is 2R.
 
-The thresholds are defaults, not backtested results. Override them with env
-vars (`COMPRESSION_BARS`, `SMALL_RANGE_ATR`, `NEAR_MA_ATR`, `BIG_RANGE_ATR`,
-`BIG_BODY_PCT`, `RR`) once `backtest_compression.py` finds better values.
+## Backtest results (2 Oct 2026)
+
+| Chart | Data | Result |
+|---|---|---|
+| 15m | 60 days | **No edge.** Every top setting lost money on the unseen period. |
+| 1h | 2 years | **Small edge.** Training years: 115 trades, 41% wins, +0.09R/trade. Unseen last 30%: 25 trades, 44% wins, +0.22R/trade. |
+
+A 41–44% win rate with 2R targets is a thin edge built on few trades. Paper
+trade it for a few weeks before risking real money, and keep risk per trade small.
 
 ## Setup
 
