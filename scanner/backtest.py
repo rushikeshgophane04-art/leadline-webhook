@@ -14,14 +14,16 @@ import yfinance as yf
 from scan_once import ATR_LEN, MA_LEN, PAIRS, add_indicators
 
 GRID = {
-    "n": [4, 6, 8],                 # compression bars
-    "small": [0.4, 0.6, 0.8],            # small candle: range < x * ATR
-    "near": [0.3, 0.5, 0.8],             # close within x * ATR of MA
-    "big": [1.2, 1.5, 2.0],         # breakout: range >= x * ATR
-    "rr": [1.5, 2.0],               # target in R
+    "n": [3, 4, 6],                 # compression bars
+    "small": [0.6, 0.8, 1.0],       # small candle: range < x * ATR
+    "near": [0.5, 0.8, 1.2],        # close within x * ATR of MA
+    "big": [1.0, 1.3, 1.6],         # breakout: range >= x * ATR
+    "rr": [1.0, 1.5, 2.0],          # target in R
 }
+INTERVAL = os.getenv("BT_INTERVAL", "15m")
+PERIOD = {"15m": "60d", "1h": "730d"}[INTERVAL]
 BODY_PCT = 0.6
-MAX_HOLD = 96          # bars (24h); exit at close after that
+MAX_HOLD = 96          # bars; exit at close after that
 TRAIN_FRAC = 0.7
 MIN_TRADES = 15
 
@@ -31,7 +33,7 @@ def spread(pair):
 
 
 def load(pair):
-    df = yf.download(f"{pair}=X", period="60d", interval="15m",
+    df = yf.download(f"{pair}=X", period=PERIOD, interval=INTERVAL,
                      progress=False, auto_adjust=False)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
@@ -126,21 +128,21 @@ def main():
     res = res[cols]
 
     default = res[(res.n == 6) & (res.small == 0.6) & (res.near == 0.5)
-                  & (res.big == 1.5) & (res.rr == 2.0)]
+                  & (res.big == 1.6) & (res.rr == 2.0)]
     min_trades = MIN_TRADES if (res.train_trades >= MIN_TRADES).any() else 5
     best = (res[res.train_trades >= min_trades]
             .sort_values("train_totalR", ascending=False).head(10))
 
-    out = [f"# Backtest: {len(combos)} rule combos, {len(data)} pairs, 15m, ~60 days",
+    out = [f"# Backtest {INTERVAL}: {len(combos)} rule combos, {len(data)} pairs, {PERIOD}",
            f"Train = first {int(TRAIN_FRAC*100)}%, test = last {100-int(TRAIN_FRAC*100)}% "
            f"(unseen). R = multiples of risk, after ~2 pip spread.",
            "", "## Top 10 by train total R (min %d trades)" % min_trades,
            best.to_markdown(index=False) if not best.empty else "_none_",
-           "", "## Scanner's current settings (n=6 small=0.6 near=0.5 big=1.5 rr=2)",
+           "", "## Scanner's current settings (n=6 small=0.6 near=0.5 big=1.6 rr=2)",
            default.to_markdown(index=False)]
     text = "\n".join(out)
     print(text)
-    res.to_csv("backtest_results.csv", index=False)
+    res.to_csv(f"backtest_results_{INTERVAL}.csv", index=False)
     summary = os.getenv("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a") as f:
