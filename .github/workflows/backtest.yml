@@ -6,6 +6,10 @@ on:
 jobs:
   backtest:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        interval: ["15m", "1h"]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -16,7 +20,9 @@ jobs:
           cache-dependency-path: scanner/requirements.txt
       - run: pip install -r scanner/requirements.txt
       - run: python scanner/backtest.py
+        env:
+          BT_INTERVAL: ${{ matrix.interval }}
       - uses: actions/upload-artifact@v4
         with:
-          name: backtest-results
-          path: backtest_results.csv
+          name: backtest-results-${{ matrix.interval }}
+          path: backtest_results_${{ matrix.interval }}.csv
