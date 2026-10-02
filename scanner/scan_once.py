@@ -1,5 +1,9 @@
 """
-One-shot forex compression scanner (run every 15 min by GitHub Actions).
+One-shot forex compression scanner (run hourly by GitHub Actions).
+
+Defaults are the best 1h settings from backtest.py (2 years, 10 pairs):
++0.09R/trade on the training years, +0.22R/trade on the unseen last 30%.
+The 15m chart showed no edge out of sample.
 
 Setup: a run of small candles hugging the 52 MA (compression), then one big
 candle that breaks out of the compression box.
@@ -24,15 +28,15 @@ PAIRS = [
     "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD",
     "USDCHF", "NZDUSD", "EURJPY", "GBPJPY", "EURGBP",
 ]
-INTERVAL = "15m"
-INTERVAL_MIN = 15
+INTERVAL = "1h"
+INTERVAL_MIN = 60
 MA_LEN = 52
 ATR_LEN = 14
 
-COMPRESSION_BARS = int(os.getenv("COMPRESSION_BARS", "6"))   # small candles in a row
-SMALL_RANGE_ATR = float(os.getenv("SMALL_RANGE_ATR", "0.6"))  # small = range < x * ATR
-NEAR_MA_ATR = float(os.getenv("NEAR_MA_ATR", "0.5"))          # close within x * ATR of MA
-BIG_RANGE_ATR = float(os.getenv("BIG_RANGE_ATR", "1.5"))      # big = range >= x * ATR
+COMPRESSION_BARS = int(os.getenv("COMPRESSION_BARS", "4"))   # small candles in a row
+SMALL_RANGE_ATR = float(os.getenv("SMALL_RANGE_ATR", "0.8"))  # small = range < x * ATR
+NEAR_MA_ATR = float(os.getenv("NEAR_MA_ATR", "1.2"))          # close within x * ATR of MA
+BIG_RANGE_ATR = float(os.getenv("BIG_RANGE_ATR", "1.6"))      # big = range >= x * ATR
 BIG_BODY_PCT = float(os.getenv("BIG_BODY_PCT", "0.6"))        # body >= x of range
 RR = float(os.getenv("RR", "2.0"))                            # target = RR * risk
 
@@ -45,7 +49,7 @@ DRY_RUN = os.getenv("DRY_RUN") == "1"
 
 def fetch(pair: str) -> pd.DataFrame:
     """Download recent candles and drop the still-forming last bar."""
-    df = yf.download(f"{pair}=X", period="5d", interval=INTERVAL,
+    df = yf.download(f"{pair}=X", period="30d", interval=INTERVAL,
                      progress=False, auto_adjust=False)
     if df.empty:
         return df

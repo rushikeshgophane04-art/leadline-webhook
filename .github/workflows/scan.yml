@@ -2,7 +2,7 @@ name: Forex compression scan
 
 on:
   schedule:
-    - cron: "*/15 * * * 1-5"   # every 15 min, Mon-Fri (UTC)
+    - cron: "3 * * * 1-5"      # hourly, just after each 1h candle closes (UTC)
   workflow_dispatch:           # Actions -> Run workflow
 
 concurrency:
