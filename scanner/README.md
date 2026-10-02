@@ -15,14 +15,14 @@ vars (`COMPRESSION_BARS`, `SMALL_RANGE_ATR`, `NEAR_MA_ATR`, `BIG_RANGE_ATR`,
 
 ## Setup
 
-1. Create a bot with @BotFather and copy the token. Send the bot a message,
-   then open `https://api.telegram.org/bot<TOKEN>/getUpdates` to find your
-   `chat.id`.
-2. Go to repo **Settings → Secrets and variables → Actions** and add
-   `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
-3. Merge `.github/workflows/scan.yml` into the default branch. Scheduled runs
-   and the **Run workflow** button only appear for workflows on the default
-   branch.
-4. Go to **Actions → Forex compression scan → Run workflow** to test it.
+1. In Telegram, message @BotFather, send `/newbot`, copy the token, then send
+   your new bot any message (e.g. "hi").
+2. Go to repo **Settings → Secrets and variables → Actions → New repository
+   secret**, name it `TELEGRAM_BOT_TOKEN` and paste the token. The chat is
+   found automatically (set `TELEGRAM_CHAT_ID` only to send to a different chat).
+3. Go to **Actions → Forex compression scan → Run workflow** to test it.
+
+Backtest: **Actions → Forex compression backtest → Run workflow**; results
+appear on the run's summary page.
 
 Local dry run: `DRY_RUN=1 python scanner/scan_once.py`

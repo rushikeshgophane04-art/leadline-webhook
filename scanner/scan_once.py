@@ -136,13 +136,27 @@ def message(pair, kind, info) -> str:
             f"Bar: {info['bar']}")
 
 
+def chat_id():
+    """Use TELEGRAM_CHAT_ID, or else the last chat that messaged the bot."""
+    if TELEGRAM_CHAT_ID:
+        return TELEGRAM_CHAT_ID
+    r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                     timeout=20)
+    r.raise_for_status()
+    for upd in reversed(r.json().get("result", [])):
+        msg = upd.get("message") or upd.get("channel_post")
+        if msg:
+            return msg["chat"]["id"]
+    raise RuntimeError("No chat found: send any message to your bot first")
+
+
 def send_telegram(text: str):
-    if DRY_RUN or not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
+    if DRY_RUN or not TELEGRAM_TOKEN:
         print("[telegram skipped]\n" + text)
         return
     r = requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-        json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=20)
+        json={"chat_id": chat_id(), "text": text}, timeout=20)
     r.raise_for_status()
 
 
