@@ -19,6 +19,7 @@ jobs:
       - run: python strategy_lab/system_test.py
       - run: python strategy_lab/fx_lab.py
       - run: python strategy_lab/gap_lab.py
+      - run: python strategy_lab/gap_go.py
       - uses: actions/upload-artifact@v4
         with:
           name: strategy-lab-results
