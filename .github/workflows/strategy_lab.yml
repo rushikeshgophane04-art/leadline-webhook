@@ -16,7 +16,10 @@ jobs:
           cache-dependency-path: strategy_lab/requirements.txt
       - run: pip install -r strategy_lab/requirements.txt
       - run: python strategy_lab/strategy_lab.py
+      - run: python strategy_lab/system_test.py
       - uses: actions/upload-artifact@v4
         with:
           name: strategy-lab-results
-          path: strategy_lab_results.csv
+          path: |
+            strategy_lab_results.csv
+            system_test_results.csv
